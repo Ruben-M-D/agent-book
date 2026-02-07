@@ -1,6 +1,6 @@
 import anthropic
 
-from config import settings
+from config import MODEL_PRICING, settings
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -16,19 +16,29 @@ def _get_client():
     return _client
 
 
+def _calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    pricing = MODEL_PRICING.get(model)
+    if not pricing:
+        return 0.0
+    input_price, output_price = pricing
+    return (input_tokens * input_price + output_tokens * output_price) / 1_000_000
+
+
 def run_agent_loop(
     messages: list[dict],
     system: str,
     tools: list[dict],
     execute_tool,
     model: str | None = None,
-    max_iterations: int = 20,
+    max_iterations: int | None = None,
     label: str = "",
     on_first_output=None,
     output_fn=None,
 ) -> tuple[str, dict]:
     """Tool-use loop: call LLM, execute tools, repeat until done."""
     model = model or settings.claude_model
+    if max_iterations is None:
+        max_iterations = settings.max_iterations
     client = _get_client()
     prefix = f"[{label}] " if label else ""
     usage = {"input_tokens": 0, "output_tokens": 0}
@@ -75,7 +85,8 @@ def run_agent_loop(
             messages.append({"role": "user", "content": tool_results})
         elif response.stop_reason == "end_turn":
             _notify()
-            stats = {"usage": usage, "tools_used": tools_used}
+            cost = _calculate_cost(model, usage["input_tokens"], usage["output_tokens"])
+            stats = {"usage": usage, "tools_used": tools_used, "cost_usd": cost}
             for block in assistant_content:
                 if hasattr(block, "text"):
                     return block.text, stats
@@ -84,7 +95,8 @@ def run_agent_loop(
             break
 
     _notify()
-    return "(max iterations reached)", {"usage": usage, "tools_used": tools_used}
+    cost = _calculate_cost(model, usage["input_tokens"], usage["output_tokens"])
+    return "(max iterations reached)", {"usage": usage, "tools_used": tools_used, "cost_usd": cost}
 
 
 def simple_completion(prompt: str, system: str = "", model: str | None = None) -> str:

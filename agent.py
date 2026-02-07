@@ -2,10 +2,12 @@
 
 import json
 import os
+import random
 import re
 import sys
 import threading
 import time
+from functools import partial
 
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
@@ -23,6 +25,7 @@ ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 from config import settings
 from llm import run_agent_loop, simple_completion
+from memory import MemoryStore, load as load_memory, save as save_memory
 from personality import generate_system_prompt, load_personality, save_personality
 from tools import TOOLS, execute_tool
 
@@ -52,6 +55,20 @@ cycle_count = 0
 
 HISTORY_PATH = os.path.join(os.path.dirname(__file__), "chat_history.json")
 MAX_HISTORY = 20
+
+# -- Session stats ------------------------------------------------------------
+
+session_stats = {
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "total_cost_usd": 0.0,
+    "cycles_completed": 0,
+    "posts_created": 0,
+    "replies_sent": 0,
+    "votes_cast": 0,
+    "session_start": time.time(),
+}
+stats_lock = threading.Lock()
 
 # -- ANSI lexer ---------------------------------------------------------------
 
@@ -99,20 +116,31 @@ output_raw_lines: list[str] = []
 output_lock = threading.Lock()
 auto_scroll = True
 
+# Memory instance (loaded in main)
+memory: MemoryStore | None = None
+
 
 def strip_ansi(text: str) -> str:
     return ANSI_RE.sub('', text)
 
 
 def append_output(text: str):
-    """Thread-safe append to the output area."""
+    """Thread-safe append to the output area, with buffer cap."""
     lines = text.split('\n')
     clean_lines = [strip_ansi(l) for l in lines]
+    cap = settings.output_buffer_lines
+
     with output_lock:
         output_raw_lines.extend(lines)
-        current = output_buffer.text
-    addition = "\n".join(clean_lines)
-    new_text = (current + "\n" + addition) if current else addition
+        # Trim from front if over cap
+        if len(output_raw_lines) > cap:
+            excess = len(output_raw_lines) - cap
+            del output_raw_lines[:excess]
+
+    # Rebuild buffer text from raw lines
+    with output_lock:
+        new_text = "\n".join(strip_ansi(l) for l in output_raw_lines)
+
     cursor = len(new_text) if auto_scroll else min(output_buffer.cursor_position, len(new_text))
     output_buffer.set_document(Document(new_text, cursor), bypass_readonly=True)
     if app and app.is_running:
@@ -147,6 +175,127 @@ def save_history(messages: list[dict]):
         json.dump(saveable, f)
 
 
+# -- Stats helpers ------------------------------------------------------------
+
+
+def _update_stats(stats: dict):
+    """Update session_stats from an LLM call's returned stats dict."""
+    with stats_lock:
+        usage = stats.get("usage", {})
+        session_stats["total_input_tokens"] += usage.get("input_tokens", 0)
+        session_stats["total_output_tokens"] += usage.get("output_tokens", 0)
+        session_stats["total_cost_usd"] += stats.get("cost_usd", 0.0)
+        for tool in stats.get("tools_used", []):
+            if tool == "create_post":
+                session_stats["posts_created"] += 1
+            elif tool in ("reply_to_post", "reply_to_reply"):
+                session_stats["replies_sent"] += 1
+            elif tool == "vote":
+                session_stats["votes_cast"] += 1
+
+
+def _format_stats() -> str:
+    with stats_lock:
+        s = session_stats
+    elapsed = time.time() - s["session_start"]
+    mins = int(elapsed // 60)
+    secs = int(elapsed % 60)
+    total_tokens = s["total_input_tokens"] + s["total_output_tokens"]
+    return (
+        f"{CYAN}{BOLD}Session Stats{RESET}\n"
+        f"  {DIM}Uptime:{RESET} {mins}m {secs}s\n"
+        f"  {DIM}Cycles completed:{RESET} {s['cycles_completed']}\n"
+        f"  {DIM}Total tokens:{RESET} {total_tokens:,} ({s['total_input_tokens']:,} in / {s['total_output_tokens']:,} out)\n"
+        f"  {DIM}Total cost:{RESET} ${s['total_cost_usd']:.4f}\n"
+        f"  {DIM}Posts created:{RESET} {s['posts_created']}\n"
+        f"  {DIM}Replies sent:{RESET} {s['replies_sent']}\n"
+        f"  {DIM}Votes cast:{RESET} {s['votes_cast']}\n"
+        f"  {DIM}Model:{RESET} {settings.claude_model}"
+    )
+
+
+# -- Adaptive cycle strategy --------------------------------------------------
+
+
+def _pick_cycle_strategy(mem: MemoryStore) -> str:
+    """Pick a varied strategy for the auto-cycle based on memory context."""
+    strategies = []
+
+    # Follow-up conversations — prioritize responding to bots who replied to us
+    if mem.has_pending_conversations():
+        strategies.append(("follow_up", 3))
+    else:
+        strategies.append(("follow_up", 1))
+
+    # Create new post — more likely if it's been a while
+    if mem.cycles_since_last_post() > 4:
+        strategies.append(("create_post", 2))
+    else:
+        strategies.append(("create_post", 1))
+
+    # Engage & reply — always available
+    strategies.append(("engage_reply", 2))
+
+    # Lurk mode — browse and vote only
+    strategies.append(("lurk", 1))
+
+    # Search & discover
+    strategies.append(("search_discover", 1))
+
+    # Weighted random selection
+    names, weights = zip(*strategies)
+    choice = random.choices(names, weights=weights, k=1)[0]
+
+    prompts = {
+        "follow_up": (
+            "You are running an autonomous cycle. STRATEGY: Follow up on conversations.\n"
+            "1. Check your notifications for any unread replies — this is your TOP PRIORITY\n"
+            "2. For each notification where another bot replied to you, read that post and reply back thoughtfully\n"
+            "3. If no notifications, browse 'new' posts and engage with 1-2\n"
+            "4. Vote on posts you have opinions about\n\n"
+            "Focus on continuing existing conversations. Be responsive and engaged."
+        ),
+        "create_post": (
+            "You are running an autonomous cycle. STRATEGY: Create a new post.\n"
+            "1. Check your notifications for any unread replies first\n"
+            "2. Browse 'hot' and 'new' posts for inspiration\n"
+            "3. Create an original post about something that interests you — share a thought, ask a question, or start a debate\n"
+            "4. Vote on a few posts while browsing\n\n"
+            "Be creative! Post something fresh and interesting that invites discussion.\n"
+            "IMPORTANT: You MUST actually call the create_post tool to publish your post. Don't just compose it — submit it."
+        ),
+        "engage_reply": (
+            "You are running an autonomous cycle. STRATEGY: Engage and reply.\n"
+            "1. Check your notifications for any unread replies\n"
+            "2. Browse recent posts (try 'hot' or 'new')\n"
+            "3. Read 1-2 interesting posts in full\n"
+            "4. Reply to posts where you have something genuine to say\n"
+            "5. Vote on posts you have opinions about\n\n"
+            "Be selective — only reply when you have something worth saying.\n"
+            "IMPORTANT: You MUST actually call reply_to_post or reply_to_reply to submit your reply. Don't just compose it — submit it."
+        ),
+        "lurk": (
+            "You are running an autonomous cycle. STRATEGY: Lurk mode.\n"
+            "1. Check your notifications for any unread replies (reply if someone directly addressed you)\n"
+            "2. Browse 'hot' and 'new' posts\n"
+            "3. Read 2-3 interesting posts\n"
+            "4. Vote on posts and replies — upvote good content, downvote bad\n"
+            "5. Do NOT create new posts or replies this cycle (unless replying to a direct notification)\n\n"
+            "Just observe and vote. Take it easy this round."
+        ),
+        "search_discover": (
+            "You are running an autonomous cycle. STRATEGY: Search and discover.\n"
+            "1. Check your notifications for any unread replies\n"
+            "2. Search for posts about topics that interest you\n"
+            "3. Read 1-2 posts from the search results\n"
+            "4. If you find something interesting, reply or vote\n\n"
+            "Explore and discover new conversations on topics you care about."
+        ),
+    }
+
+    return prompts[choice]
+
+
 # -- Auto loop ----------------------------------------------------------------
 
 
@@ -157,6 +306,8 @@ def auto_loop(personality: dict):
 
     while running.is_set():
         cycle_count += 1
+        if memory:
+            memory.cycle_count = cycle_count
 
         if auto_paused.is_set():
             append_output(f"{YELLOW}[AUTO]{RESET} {DIM}Cycle {cycle_count} — paused. Type 'resume' to restart.{RESET}")
@@ -166,6 +317,16 @@ def auto_loop(personality: dict):
                 _run_auto_cycle(personality)
             except Exception as e:
                 append_output(f"{RED}[AUTO] Error: {e}{RESET}")
+
+            with stats_lock:
+                session_stats["cycles_completed"] = cycle_count
+
+            # Save memory after each cycle
+            if memory:
+                try:
+                    save_memory(memory)
+                except Exception:
+                    pass
 
         interval = settings.auto_interval
         append_output(f"{YELLOW}[AUTO]{RESET} {DIM}Next cycle in {interval // 60}:{interval % 60:02d}...{RESET}")
@@ -180,9 +341,9 @@ def _sleep_interruptible(seconds: int):
 
 
 def _run_auto_cycle(personality: dict):
-    system = generate_system_prompt(personality)
+    system = generate_system_prompt(personality, memory=memory)
 
-    auto_prompt = (
+    auto_prompt = _pick_cycle_strategy(memory) if memory else (
         "You are running an autonomous cycle. Do the following:\n"
         "1. Check your notifications for any unread replies\n"
         "2. Browse recent posts (try 'hot' or 'new')\n"
@@ -193,19 +354,38 @@ def _run_auto_cycle(personality: dict):
         "It's fine to just browse and vote if nothing catches your eye."
     )
 
+    # Inject memory context into the prompt itself
+    if memory:
+        replied_ids = list(memory.posts_replied.keys())
+        if replied_ids:
+            auto_prompt += f"\n\nREMINDER: You already replied to these post IDs: {replied_ids[-20:]}. Do NOT reply to them again."
+
     with chat_lock:
         context_msgs = list(chat_messages[-6:])
 
     messages = context_msgs + [{"role": "user", "content": auto_prompt}]
 
+    # Create execute_tool wrapper that passes memory
+    tool_executor = partial(execute_tool, memory=memory)
+
     response, stats = run_agent_loop(
         messages=messages,
         system=system,
         tools=TOOLS,
-        execute_tool=execute_tool,
+        execute_tool=tool_executor,
         label="AUTO",
         output_fn=append_output,
     )
+
+    _update_stats(stats)
+
+    # Record cycle summary
+    if memory:
+        memory.add_cycle_summary(
+            cycle=cycle_count,
+            actions=stats.get("tools_used", []),
+            summary=response[:150] if response else "no response",
+        )
 
     if response:
         append_output(f"{YELLOW}[AUTO]{RESET} {response}")
@@ -259,7 +439,7 @@ input_area = None
 def process_input(text: str):
     global personality
 
-    lower = text.lower()
+    lower = text.lower().strip()
     if lower in ("quit", "exit", "q"):
         _shutdown()
         return
@@ -273,6 +453,17 @@ def process_input(text: str):
         append_output(f"{CYAN}Agent:{RESET} Resumed! I'll start posting again next cycle.")
         invalidate()
         return
+    elif lower == "stats":
+        append_output(_format_stats())
+        invalidate()
+        return
+    elif lower == "memory":
+        if memory:
+            append_output(f"{CYAN}{BOLD}Memory Summary{RESET}\n{memory.to_context_string()}")
+        else:
+            append_output(f"{DIM}Memory not loaded.{RESET}")
+        invalidate()
+        return
 
     append_output(f"{GREEN}You:{RESET} {text}")
 
@@ -280,26 +471,38 @@ def process_input(text: str):
         chat_messages.append({"role": "user", "content": text})
         messages = list(chat_messages)
 
-    system = generate_system_prompt(personality)
+    system = generate_system_prompt(personality, memory=memory)
 
     thinking.set()
     invalidate()
+
+    # Create execute_tool wrapper that passes memory
+    tool_executor = partial(execute_tool, memory=memory)
 
     response, stats = run_agent_loop(
         messages=messages,
         system=system,
         tools=TOOLS,
-        execute_tool=execute_tool,
+        execute_tool=tool_executor,
         label="CHAT",
         output_fn=append_output,
         on_first_output=lambda: (thinking.clear(), invalidate()),
     )
+
+    _update_stats(stats)
 
     thinking.clear()
     append_output(f"{CYAN}Agent:{RESET} {response}")
 
     with chat_lock:
         chat_messages.append({"role": "assistant", "content": response})
+
+    # Save memory after chat interactions too
+    if memory:
+        try:
+            save_memory(memory)
+        except Exception:
+            pass
 
     threading.Thread(
         target=update_personality,
@@ -314,6 +517,8 @@ def _shutdown():
         with chat_lock:
             save_history(chat_messages)
         save_personality(personality)
+        if memory:
+            save_memory(memory)
     except Exception:
         pass
     if app and app.is_running:
@@ -328,7 +533,13 @@ def build_status_bar():
         return [("class:status-thinking", "  thinking... ")]
     if auto_paused.is_set():
         return [("class:status-paused", "  paused "), ("class:status", " type 'resume' to restart")]
-    return [("class:status", f"  agent-book | auto cycle every {settings.auto_interval}s ")]
+
+    with stats_lock:
+        cost = session_stats["total_cost_usd"]
+        total_tokens = session_stats["total_input_tokens"] + session_stats["total_output_tokens"]
+
+    parts = f"  cycle {cycle_count} | ${cost:.4f} | {total_tokens:,} tokens | auto every {settings.auto_interval}s "
+    return [("class:status", parts)]
 
 
 ui_style = Style.from_dict({
@@ -341,7 +552,7 @@ ui_style = Style.from_dict({
 
 
 def main():
-    global app, output_window, personality, input_area
+    global app, output_window, personality, input_area, memory
 
     if not settings.anthropic_api_key:
         print(f"Error: ANTHROPIC_API_KEY not set. Copy .env.example to .env and fill it in.")
@@ -351,6 +562,7 @@ def main():
         sys.exit(1)
 
     personality = load_personality()
+    memory = load_memory()
 
     with chat_lock:
         chat_messages.extend(load_history())
@@ -366,11 +578,17 @@ def main():
         "",
         f"  {DIM}Type messages below. Alt+Enter for newline.{RESET}",
         f"  {DIM}Scroll: Mouse wheel, PageUp/Down, Shift+Up/Down, Home/End{RESET}",
-        f"  {DIM}Commands:{RESET} {YELLOW}stop{RESET} {DIM}/{RESET} {GREEN}resume{RESET} {DIM}/{RESET} {RED}quit{RESET}",
+        f"  {DIM}Commands:{RESET} {YELLOW}stop{RESET} {DIM}/{RESET} {GREEN}resume{RESET} {DIM}/{RESET} {YELLOW}stats{RESET} {DIM}/{RESET} {YELLOW}memory{RESET} {DIM}/{RESET} {RED}quit{RESET}",
         f"{CYAN}{BOLD}{'═' * 50}{RESET}",
     ]
     if chat_messages:
         banner_lines.append(f"  {DIM}Restored {len(chat_messages)} messages from last session{RESET}")
+    if memory and (memory.posts_read or memory.posts_created):
+        banner_lines.append(
+            f"  {DIM}Memory loaded: {len(memory.posts_read)} posts read, "
+            f"{len(memory.posts_created)} created, "
+            f"{len(memory.bots_interacted)} bots known{RESET}"
+        )
     banner_lines.append("")
 
     for line in banner_lines:
@@ -508,6 +726,8 @@ def main():
     with chat_lock:
         save_history(chat_messages)
     save_personality(personality)
+    if memory:
+        save_memory(memory)
 
 
 if __name__ == "__main__":

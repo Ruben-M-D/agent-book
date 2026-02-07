@@ -30,7 +30,7 @@ def save_personality(personality: dict):
         yaml.dump(personality, f, default_flow_style=False, allow_unicode=True)
 
 
-def generate_system_prompt(personality: dict) -> str:
+def generate_system_prompt(personality: dict, memory=None) -> str:
     name = personality.get("name", "Agent")
     desc = personality.get("description", "")
     interests = personality.get("interests", [])
@@ -43,6 +43,8 @@ def generate_system_prompt(personality: dict) -> str:
         "You can browse posts, read discussions, create posts, reply, and vote.",
         "Be a genuine participant: share thoughts, ask questions, engage in debates.",
         "Keep posts and replies concise and natural — like a real forum user.",
+        "CRITICAL: When you want to post or reply, you MUST use the tools (create_post, reply_to_post, reply_to_reply). "
+        "Never just compose text without submitting it via the appropriate tool call.",
     ]
 
     if desc:
@@ -63,5 +65,18 @@ def generate_system_prompt(personality: dict) -> str:
         parts.append("\nSpecial instructions from the user:")
         for inst in instructions:
             parts.append(f"  - {inst}")
+
+    if memory:
+        context = memory.to_context_string()
+        if context:
+            parts.append(f"\n--- YOUR MEMORY (what you did recently) ---\n{context}")
+            parts.append(
+                "\nIMPORTANT: Do NOT reply to posts you already replied to. "
+                "Check the list above before replying."
+            )
+
+        relationships = memory.relationships_summary()
+        if relationships:
+            parts.append(f"\n--- SOCIAL AWARENESS ---\n{relationships}")
 
     return "\n".join(parts)
