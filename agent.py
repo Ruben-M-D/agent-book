@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -9,13 +10,16 @@ import time
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
-from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.lexers import Lexer
+from prompt_toolkit.mouse_events import MouseEventType
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
+
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 from config import settings
 from llm import run_agent_loop, simple_completion
@@ -49,27 +53,70 @@ cycle_count = 0
 HISTORY_PATH = os.path.join(os.path.dirname(__file__), "chat_history.json")
 MAX_HISTORY = 20
 
+# -- ANSI lexer ---------------------------------------------------------------
+
+ANSI_STYLE_MAP = {
+    "0": None, "1": "bold", "2": "#888888",
+    "31": "ansired", "32": "ansigreen", "33": "ansiyellow",
+    "34": "ansiblue", "35": "ansimagenta", "36": "ansicyan",
+}
+
+
+def _parse_ansi(text: str):
+    """Convert an ANSI-coded string to prompt_toolkit (style, text) fragments."""
+    fragments = []
+    parts: list[str] = []
+    pos = 0
+    for m in re.finditer(r'\x1b\[([0-9;]*)m', text):
+        if m.start() > pos:
+            fragments.append((" ".join(parts), text[pos:m.start()]))
+        for code in m.group(1).split(';'):
+            mapped = ANSI_STYLE_MAP.get(code)
+            if mapped is None and code in ANSI_STYLE_MAP:
+                parts = []
+            elif mapped:
+                parts.append(mapped)
+        pos = m.end()
+    if pos < len(text):
+        fragments.append((" ".join(parts), text[pos:]))
+    return fragments or [("", "")]
+
+
+class AnsiLexer(Lexer):
+    def lex_document(self, document):
+        def get_line(lineno):
+            if lineno < len(output_raw_lines):
+                return _parse_ansi(output_raw_lines[lineno])
+            return [("", "")]
+        return get_line
+
+
 # -- App globals (set in main) ------------------------------------------------
 
 app: Application | None = None
-output_window: Window | None = None
-output_lines: list[str] = []
+output_buffer = Buffer(name="output", read_only=True)
+output_raw_lines: list[str] = []
 output_lock = threading.Lock()
+auto_scroll = True
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub('', text)
 
 
 def append_output(text: str):
     """Thread-safe append to the output area."""
+    lines = text.split('\n')
+    clean_lines = [strip_ansi(l) for l in lines]
     with output_lock:
-        output_lines.append(text)
-    if output_window:
-        output_window.vertical_scroll = 999999
+        output_raw_lines.extend(lines)
+        current = output_buffer.text
+    addition = "\n".join(clean_lines)
+    new_text = (current + "\n" + addition) if current else addition
+    cursor = len(new_text) if auto_scroll else min(output_buffer.cursor_position, len(new_text))
+    output_buffer.set_document(Document(new_text, cursor), bypass_readonly=True)
     if app and app.is_running:
         app.invalidate()
-
-
-def get_output_text():
-    with output_lock:
-        return ANSI("\n".join(output_lines))
 
 
 def invalidate():
@@ -95,6 +142,7 @@ def save_history(messages: list[dict]):
     for msg in messages[-MAX_HISTORY:]:
         if isinstance(msg.get("content"), str):
             saveable.append(msg)
+    os.makedirs(os.path.dirname(HISTORY_PATH) or ".", exist_ok=True)
     with open(HISTORY_PATH, "w") as f:
         json.dump(saveable, f)
 
@@ -262,9 +310,12 @@ def process_input(text: str):
 
 def _shutdown():
     running.clear()
-    with chat_lock:
-        save_history(chat_messages)
-    save_personality(personality)
+    try:
+        with chat_lock:
+            save_history(chat_messages)
+        save_personality(personality)
+    except Exception:
+        pass
     if app and app.is_running:
         app.exit()
 
@@ -314,7 +365,7 @@ def main():
         f"  {DIM}Forum:{RESET} {BLUE}{settings.bot_book_url}{RESET}",
         "",
         f"  {DIM}Type messages below. Alt+Enter for newline.{RESET}",
-        f"  {DIM}Scroll: PageUp/Down, Shift+Up/Down, Home/End{RESET}",
+        f"  {DIM}Scroll: Mouse wheel, PageUp/Down, Shift+Up/Down, Home/End{RESET}",
         f"  {DIM}Commands:{RESET} {YELLOW}stop{RESET} {DIM}/{RESET} {GREEN}resume{RESET} {DIM}/{RESET} {RED}quit{RESET}",
         f"{CYAN}{BOLD}{'═' * 50}{RESET}",
     ]
@@ -322,11 +373,36 @@ def main():
         banner_lines.append(f"  {DIM}Restored {len(chat_messages)} messages from last session{RESET}")
     banner_lines.append("")
 
-    with output_lock:
-        output_lines.extend(banner_lines)
+    for line in banner_lines:
+        append_output(line)
 
-    # Output area
-    output_control = FormattedTextControl(get_output_text, focusable=False, show_cursor=False)
+    # Output area with mouse scroll support
+    output_control = BufferControl(buffer=output_buffer, focusable=False, lexer=AnsiLexer())
+
+    def output_mouse_handler(mouse_event):
+        global auto_scroll
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            auto_scroll = False
+            doc = output_buffer.document
+            row = max(0, doc.cursor_position_row - 3)
+            new_pos = doc.translate_row_col_to_index(row, 0)
+            output_buffer.set_document(Document(doc.text, new_pos), bypass_readonly=True)
+            output_window.vertical_scroll = max(0, output_window.vertical_scroll - 3)
+            invalidate()
+            return None
+        elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            doc = output_buffer.document
+            row = min(doc.line_count - 1, doc.cursor_position_row + 3)
+            new_pos = doc.translate_row_col_to_index(row, 0)
+            output_buffer.set_document(Document(doc.text, new_pos), bypass_readonly=True)
+            output_window.vertical_scroll += 3
+            if row >= doc.line_count - 5:
+                auto_scroll = True
+            invalidate()
+            return None
+        return NotImplemented
+
+    output_control.mouse_handler = output_mouse_handler
     output_window = Window(content=output_control, wrap_lines=True)
 
     # Input area
@@ -356,8 +432,10 @@ def main():
 
     @kb.add("enter")
     def handle_enter(event):
+        global auto_scroll
         text = input_area.text.strip()
         if text:
+            auto_scroll = True
             input_area.text = ""
             threading.Thread(target=process_input, args=(text,), daemon=True).start()
 
@@ -368,20 +446,44 @@ def main():
     @kb.add("pageup")
     @kb.add("s-up")
     def scroll_up(event):
+        global auto_scroll
+        auto_scroll = False
+        doc = output_buffer.document
+        row = max(0, doc.cursor_position_row - 5)
+        new_pos = doc.translate_row_col_to_index(row, 0)
+        output_buffer.set_document(Document(doc.text, new_pos), bypass_readonly=True)
         output_window.vertical_scroll = max(0, output_window.vertical_scroll - 5)
+        invalidate()
 
     @kb.add("pagedown")
     @kb.add("s-down")
     def scroll_down(event):
+        global auto_scroll
+        doc = output_buffer.document
+        row = min(doc.line_count - 1, doc.cursor_position_row + 5)
+        new_pos = doc.translate_row_col_to_index(row, 0)
+        output_buffer.set_document(Document(doc.text, new_pos), bypass_readonly=True)
         output_window.vertical_scroll += 5
+        if row >= doc.line_count - 5:
+            auto_scroll = True
+        invalidate()
 
     @kb.add("home")
     def scroll_top(event):
+        global auto_scroll
+        auto_scroll = False
+        output_buffer.set_document(Document(output_buffer.text, 0), bypass_readonly=True)
         output_window.vertical_scroll = 0
+        invalidate()
 
     @kb.add("end")
     def scroll_bottom(event):
+        global auto_scroll
+        auto_scroll = True
+        text = output_buffer.text
+        output_buffer.set_document(Document(text, len(text)), bypass_readonly=True)
         output_window.vertical_scroll = 999999
+        invalidate()
 
     @kb.add("c-c")
     @kb.add("c-d")
