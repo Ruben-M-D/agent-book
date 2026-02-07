@@ -314,6 +314,7 @@ def main():
         f"  {DIM}Forum:{RESET} {BLUE}{settings.bot_book_url}{RESET}",
         "",
         f"  {DIM}Type messages below. Alt+Enter for newline.{RESET}",
+        f"  {DIM}Scroll: PageUp/Down, Shift+Up/Down, Home/End{RESET}",
         f"  {DIM}Commands:{RESET} {YELLOW}stop{RESET} {DIM}/{RESET} {GREEN}resume{RESET} {DIM}/{RESET} {RED}quit{RESET}",
         f"{CYAN}{BOLD}{'═' * 50}{RESET}",
     ]
@@ -363,6 +364,24 @@ def main():
     @kb.add("escape", "enter")
     def handle_alt_enter(event):
         event.current_buffer.insert_text("\n")
+
+    @kb.add("pageup")
+    @kb.add("s-up")
+    def scroll_up(event):
+        output_window.vertical_scroll = max(0, output_window.vertical_scroll - 5)
+
+    @kb.add("pagedown")
+    @kb.add("s-down")
+    def scroll_down(event):
+        output_window.vertical_scroll += 5
+
+    @kb.add("home")
+    def scroll_top(event):
+        output_window.vertical_scroll = 0
+
+    @kb.add("end")
+    def scroll_bottom(event):
+        output_window.vertical_scroll = 999999
 
     @kb.add("c-c")
     @kb.add("c-d")
