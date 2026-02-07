@@ -1,6 +1,7 @@
 """agent-book — Your AI agent for bot-book."""
 
 import json
+import os
 import sys
 import threading
 import time
@@ -8,6 +9,7 @@ import time
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.patch_stdout import patch_stdout
 
 from config import settings
 from llm import run_agent_loop, simple_completion
@@ -38,6 +40,29 @@ chat_messages: list[dict] = []
 chat_lock = threading.Lock()
 
 cycle_count = 0
+
+HISTORY_PATH = os.path.join(os.path.dirname(__file__), "chat_history.json")
+MAX_HISTORY = 20  # keep last N messages across restarts
+
+
+def load_history() -> list[dict]:
+    if os.path.exists(HISTORY_PATH):
+        try:
+            with open(HISTORY_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return []
+
+
+def save_history(messages: list[dict]):
+    # Only save simple text messages (not tool-use blocks)
+    saveable = []
+    for msg in messages[-MAX_HISTORY:]:
+        if isinstance(msg.get("content"), str):
+            saveable.append(msg)
+    with open(HISTORY_PATH, "w") as f:
+        json.dump(saveable, f)
 
 
 def safe_print(*args, **kwargs):
@@ -198,6 +223,12 @@ def main():
 
     personality = load_personality()
 
+    # Restore chat history from last session
+    with chat_lock:
+        chat_messages.extend(load_history())
+    if chat_messages:
+        print(f"{DIM}  Restored {len(chat_messages)} messages from last session{RESET}")
+
     name = personality.get("name", "Agent")
     print()
     print(f"{CYAN}{BOLD}{'=' * 50}{RESET}")
@@ -225,60 +256,63 @@ def main():
 
     session = PromptSession(key_bindings=kb, multiline=False)
 
-    while running.is_set():
-        try:
-            user_input = session.prompt(HTML("<ansigreen><b>You: </b></ansigreen>")).strip()
-        except (EOFError, KeyboardInterrupt):
-            safe_print(f"\n{DIM}Shutting down...{RESET}")
-            running.clear()
-            break
+    with patch_stdout():
+        while running.is_set():
+            try:
+                user_input = session.prompt(HTML("<ansigreen><b>You: </b></ansigreen>")).strip()
+            except (EOFError, KeyboardInterrupt):
+                safe_print(f"\n{DIM}Shutting down...{RESET}")
+                running.clear()
+                break
 
-        if not user_input:
-            continue
+            if not user_input:
+                continue
 
-        lower = user_input.lower()
-        if lower in ("quit", "exit", "q"):
-            safe_print(f"{DIM}Shutting down...{RESET}")
-            running.clear()
-            break
-        elif lower in ("stop", "stop posting", "pause"):
-            auto_paused.set()
-            safe_print(f"{CYAN}Agent:{RESET} Got it, I'll stop the auto cycle. Type {GREEN}'resume'{RESET} to restart.")
-            continue
-        elif lower == "resume":
-            auto_paused.clear()
-            safe_print(f"{CYAN}Agent:{RESET} Resumed! I'll start posting again next cycle.")
-            continue
+            lower = user_input.lower()
+            if lower in ("quit", "exit", "q"):
+                safe_print(f"{DIM}Shutting down...{RESET}")
+                running.clear()
+                break
+            elif lower in ("stop", "stop posting", "pause"):
+                auto_paused.set()
+                safe_print(f"{CYAN}Agent:{RESET} Got it, I'll stop the auto cycle. Type {GREEN}'resume'{RESET} to restart.")
+                continue
+            elif lower == "resume":
+                auto_paused.clear()
+                safe_print(f"{CYAN}Agent:{RESET} Resumed! I'll start posting again next cycle.")
+                continue
 
-        # Chat with the agent (with tools available)
-        with chat_lock:
-            chat_messages.append({"role": "user", "content": user_input})
-            messages = list(chat_messages)
+            # Chat with the agent (with tools available)
+            with chat_lock:
+                chat_messages.append({"role": "user", "content": user_input})
+                messages = list(chat_messages)
 
-        system = generate_system_prompt(personality)
+            system = generate_system_prompt(personality)
 
-        spinner.start()
-        response, stats = run_agent_loop(
-            messages=messages,
-            system=system,
-            tools=TOOLS,
-            execute_tool=execute_tool,
-            label="CHAT",
-            on_first_output=spinner.stop,
-        )
+            spinner.start()
+            response, stats = run_agent_loop(
+                messages=messages,
+                system=system,
+                tools=TOOLS,
+                execute_tool=execute_tool,
+                label="CHAT",
+                on_first_output=spinner.stop,
+            )
 
-        safe_print(f"{CYAN}Agent:{RESET} {response}")
+            safe_print(f"{CYAN}Agent:{RESET} {response}")
 
-        with chat_lock:
-            chat_messages.append({"role": "assistant", "content": response})
+            with chat_lock:
+                chat_messages.append({"role": "assistant", "content": response})
 
-        # Background personality update
-        threading.Thread(
-            target=update_personality,
-            args=(personality, user_input, response),
-            daemon=True,
-        ).start()
+            # Background personality update
+            threading.Thread(
+                target=update_personality,
+                args=(personality, user_input, response),
+                daemon=True,
+            ).start()
 
+    with chat_lock:
+        save_history(chat_messages)
     save_personality(personality)
     safe_print(f"{DIM}Personality saved. Goodbye!{RESET}")
 

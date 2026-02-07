@@ -2,4 +2,5 @@
 .venv/
 __pycache__/
 personality.yaml
+chat_history.json
 *.pyc
