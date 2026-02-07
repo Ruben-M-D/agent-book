@@ -390,6 +390,16 @@ def _run_auto_cycle(personality: dict):
     if response:
         append_output(f"{YELLOW}[AUTO]{RESET} {response}")
 
+    # Evolve personality from posts read this cycle (async)
+    if "read_post" in stats.get("tools_used", []):
+        posts_content = _extract_read_post_content(messages)
+        if posts_content:
+            threading.Thread(
+                target=evolve_personality_from_posts,
+                args=(personality, posts_content),
+                daemon=True,
+            ).start()
+
 
 # -- Personality update --------------------------------------------------------
 
@@ -426,6 +436,100 @@ def update_personality(personality: dict, user_message: str, agent_response: str
                     personality[key] = value
             save_personality(personality)
             append_output(f"  {MAGENTA}[personality updated]{RESET}")
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+
+def _extract_read_post_content(messages: list[dict]) -> list[str]:
+    """Walk messages to find tool_result content for read_post tool calls."""
+    # Build a set of tool_use_ids that correspond to read_post calls
+    read_post_ids = set()
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", [])
+        if isinstance(content, str):
+            continue
+        for block in content:
+            if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == "read_post":
+                read_post_ids.add(block.id)
+
+    # Now collect the tool_result content for those IDs
+    posts = []
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", [])
+        if isinstance(content, str):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                if block.get("tool_use_id") in read_post_ids:
+                    posts.append(block.get("content", ""))
+    return posts
+
+
+def evolve_personality_from_posts(personality: dict, posts_content: list[str]):
+    """Evaluate posts read during an auto-cycle for personality influence.
+
+    Only genuinely strong, well-argued points can update interests/opinions.
+    """
+    if not posts_content:
+        return
+
+    current_interests = json.dumps(personality.get("interests", []), indent=2)
+    current_opinions = json.dumps(personality.get("opinions", []), indent=2)
+
+    posts_text = "\n\n---\n\n".join(posts_content[:10])  # cap to avoid huge prompts
+
+    prompt = (
+        f"Current interests:\n{current_interests}\n\n"
+        f"Current opinions:\n{current_opinions}\n\n"
+        f"Posts read this cycle:\n{posts_text}\n\n"
+        "You are evaluating whether any of these posts should influence this agent's personality.\n\n"
+        "SET A VERY HIGH BAR. Most posts should result in NO_UPDATE.\n"
+        "Only update if a post makes a genuinely strong, well-argued, thought-provoking point "
+        "that would meaningfully shift this agent's thinking or introduce a new deep interest.\n\n"
+        "Examples of what QUALIFIES:\n"
+        "- A compelling argument that challenges an existing opinion\n"
+        "- An insight that opens a genuinely new area of interest\n"
+        "- A well-reasoned stance the agent hadn't considered\n\n"
+        "Examples of what does NOT qualify:\n"
+        "- Generic opinions or mild takes\n"
+        "- Anything the agent already believes or is interested in\n"
+        "- Casual conversation, jokes, or questions without substance\n"
+        "- Short or low-effort posts\n\n"
+        "You may ONLY modify:\n"
+        "- interests: add new ones (do not remove existing)\n"
+        "- opinions: add new or modify existing stances\n\n"
+        "If any update is warranted, return ONLY a JSON object like:\n"
+        '{"interests": ["existing1", "existing2", "new_interest"], '
+        '"opinions": ["existing1", "modified_or_new_opinion"]}\n\n'
+        "Include ALL existing values plus any additions/modifications.\n"
+        "If no update is warranted (the usual case), return exactly: NO_UPDATE"
+    )
+
+    result = simple_completion(
+        prompt,
+        system="You strictly evaluate whether posts contain genuinely compelling points worth absorbing into a personality. You almost always return NO_UPDATE.",
+    )
+
+    if "NO_UPDATE" in result:
+        return
+
+    try:
+        start = result.find("{")
+        end = result.rfind("}") + 1
+        if start >= 0 and end > start:
+            updates = json.loads(result[start:end])
+            changed = False
+            for key in ("interests", "opinions"):
+                if key in updates and updates[key]:
+                    personality[key] = updates[key]
+                    changed = True
+            if changed:
+                save_personality(personality)
+                append_output(f"  {MAGENTA}[personality evolved from post]{RESET}")
     except (json.JSONDecodeError, ValueError):
         pass
 
