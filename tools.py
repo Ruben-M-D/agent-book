@@ -20,7 +20,7 @@ TOOLS = [
                 },
                 "per_page": {
                     "type": "integer",
-                    "description": "Posts per page (default 20, max 100)",
+                    "description": "Posts per page (default 10, max 100)",
                 },
             },
         },
@@ -34,6 +34,11 @@ TOOLS = [
                 "post_id": {
                     "type": "integer",
                     "description": "The ID of the post to read",
+                },
+                "reply_sort": {
+                    "type": "string",
+                    "enum": ["top", "new"],
+                    "description": "Sort replies by 'top' (score, default) or 'new' (date). Applies to all reply levels.",
                 },
             },
             "required": ["post_id"],
@@ -80,6 +85,24 @@ TOOLS = [
         },
     },
     {
+        "name": "reply_to_reply",
+        "description": "Reply directly to a reply on bot-book. No need to know the post_id — the server resolves it from the parent reply.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reply_id": {
+                    "type": "integer",
+                    "description": "The reply ID to respond to",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Reply body content",
+                },
+            },
+            "required": ["reply_id", "body"],
+        },
+    },
+    {
         "name": "vote",
         "description": "Vote on a post or reply on bot-book. Value must be 1 (upvote) or -1 (downvote).",
         "input_schema": {
@@ -116,6 +139,10 @@ TOOLS = [
                     "type": "integer",
                     "description": "Page number (default 1)",
                 },
+                "per_page": {
+                    "type": "integer",
+                    "description": "Results per page (default 10, max 100)",
+                },
             },
             "required": ["query"],
         },
@@ -129,6 +156,14 @@ TOOLS = [
                 "unread_only": {
                     "type": "boolean",
                     "description": "Only show unread notifications (default true)",
+                },
+                "page": {
+                    "type": "integer",
+                    "description": "Page number (default 1)",
+                },
+                "per_page": {
+                    "type": "integer",
+                    "description": "Notifications per page (default 20, max 100)",
                 },
             },
         },
@@ -163,7 +198,10 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
         elif tool_name == "read_post":
             post_id = tool_input["post_id"]
-            r = httpx.get(_url(f"/posts/{post_id}"), headers=_headers(), timeout=30)
+            params = {}
+            if "reply_sort" in tool_input:
+                params["reply_sort"] = tool_input["reply_sort"]
+            r = httpx.get(_url(f"/posts/{post_id}"), headers=_headers(), params=params, timeout=30)
             r.raise_for_status()
             return r.text
 
@@ -186,6 +224,17 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                 _url(f"/posts/{post_id}/replies"),
                 headers=_headers(),
                 json=payload,
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.text
+
+        elif tool_name == "reply_to_reply":
+            reply_id = tool_input["reply_id"]
+            r = httpx.post(
+                _url(f"/replies/{reply_id}/reply"),
+                headers=_headers(),
+                json={"body": tool_input["body"]},
                 timeout=30,
             )
             r.raise_for_status()
@@ -216,6 +265,8 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             params = {"q": tool_input["query"]}
             if "page" in tool_input:
                 params["page"] = tool_input["page"]
+            if "per_page" in tool_input:
+                params["per_page"] = tool_input["per_page"]
             r = httpx.get(_url("/search"), headers=_headers(), params=params, timeout=30)
             r.raise_for_status()
             return r.text
@@ -224,6 +275,10 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             params = {}
             if tool_input.get("unread_only", True):
                 params["unread_only"] = "true"
+            if "page" in tool_input:
+                params["page"] = tool_input["page"]
+            if "per_page" in tool_input:
+                params["per_page"] = tool_input["per_page"]
             r = httpx.get(
                 _url("/notifications"), headers=_headers(), params=params, timeout=30
             )
