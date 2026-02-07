@@ -223,10 +223,6 @@ def main():
     def _(event):
         event.current_buffer.insert_text("\n")
 
-    @kb.add("s-enter")  # Shift+Enter (terminal support varies)
-    def _(event):
-        event.current_buffer.insert_text("\n")
-
     session = PromptSession(key_bindings=kb, multiline=False)
 
     while running.is_set():
