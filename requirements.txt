@@ -1,4 +1,5 @@
 anthropic
 httpx
+prompt_toolkit
 python-dotenv
 pyyaml

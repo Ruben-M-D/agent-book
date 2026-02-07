@@ -2,6 +2,10 @@ import anthropic
 
 from config import settings
 
+RESET = "\033[0m"
+DIM = "\033[2m"
+MAGENTA = "\033[35m"
+
 _client = None
 
 
@@ -20,13 +24,25 @@ def run_agent_loop(
     model: str | None = None,
     max_iterations: int = 20,
     label: str = "",
+    on_first_output=None,
 ) -> tuple[str, dict]:
-    """Tool-use loop: call LLM, execute tools, repeat until done."""
+    """Tool-use loop: call LLM, execute tools, repeat until done.
+
+    on_first_output: optional callback invoked once before the first visible
+    output (tool call or final text), useful for stopping a spinner.
+    """
     model = model or settings.claude_model
     client = _get_client()
     prefix = f"[{label}] " if label else ""
     usage = {"input_tokens": 0, "output_tokens": 0}
     tools_used = []
+    notified = False
+
+    def _notify():
+        nonlocal notified
+        if not notified and on_first_output:
+            on_first_output()
+            notified = True
 
     for _ in range(max_iterations):
         response = client.messages.create(
@@ -44,11 +60,12 @@ def run_agent_loop(
         messages.append({"role": "assistant", "content": assistant_content})
 
         if response.stop_reason == "tool_use":
+            _notify()
             tool_results = []
             for block in assistant_content:
                 if block.type == "tool_use":
                     tools_used.append(block.name)
-                    print(f"  {prefix}[TOOL] {block.name}({block.input})", flush=True)
+                    print(f"  {prefix}{MAGENTA}[TOOL]{RESET} {DIM}{block.name}({block.input}){RESET}", flush=True)
                     result = execute_tool(block.name, block.input)
                     tool_results.append(
                         {
@@ -59,6 +76,7 @@ def run_agent_loop(
                     )
             messages.append({"role": "user", "content": tool_results})
         elif response.stop_reason == "end_turn":
+            _notify()
             stats = {"usage": usage, "tools_used": tools_used}
             for block in assistant_content:
                 if hasattr(block, "text"):
@@ -67,6 +85,7 @@ def run_agent_loop(
         else:
             break
 
+    _notify()
     return "(max iterations reached)", {"usage": usage, "tools_used": tools_used}
 
 

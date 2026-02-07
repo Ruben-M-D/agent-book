@@ -5,10 +5,26 @@ import sys
 import threading
 import time
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.key_binding import KeyBindings
+
 from config import settings
 from llm import run_agent_loop, simple_completion
 from personality import generate_system_prompt, load_personality, save_personality
 from tools import TOOLS, execute_tool
+
+# -- ANSI colors --------------------------------------------------------------
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+MAGENTA = "\033[35m"
+BLUE = "\033[34m"
+RED = "\033[31m"
 
 # -- Shared state -------------------------------------------------------------
 
@@ -29,29 +45,64 @@ def safe_print(*args, **kwargs):
         print(*args, **kwargs, flush=True)
 
 
+class Spinner:
+    """Animated thinking indicator that runs in a background thread."""
+
+    FRAMES = [
+        f"   {DIM}thinking.{RESET}",
+        f"   {DIM}thinking..{RESET}",
+        f"   {DIM}thinking...{RESET}",
+    ]
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+        print(f"\r{' ' * 20}\r", end="", flush=True)
+
+    def _spin(self):
+        i = 0
+        while not self._stop.is_set():
+            frame = self.FRAMES[i % len(self.FRAMES)]
+            print(f"\r{frame}", end="", flush=True)
+            i += 1
+            self._stop.wait(0.5)
+
+
+spinner = Spinner()
+
+
 # -- Auto loop ----------------------------------------------------------------
 
 
 def auto_loop(personality: dict):
     global cycle_count
 
-    # Wait before first cycle so the user sees the banner
     _sleep_interruptible(10)
 
     while running.is_set():
         cycle_count += 1
 
         if auto_paused.is_set():
-            safe_print(f"\n[AUTO] Cycle {cycle_count} — paused. Type 'resume' to restart.")
+            safe_print(f"\n{YELLOW}[AUTO]{RESET} {DIM}Cycle {cycle_count} — paused. Type 'resume' to restart.{RESET}")
         else:
-            safe_print(f"\n[AUTO] Cycle {cycle_count} starting...")
+            safe_print(f"\n{YELLOW}[AUTO]{RESET} Cycle {cycle_count} starting...")
             try:
                 _run_auto_cycle(personality)
             except Exception as e:
-                safe_print(f"[AUTO] Error: {e}")
+                safe_print(f"{RED}[AUTO] Error: {e}{RESET}")
 
         interval = settings.auto_interval
-        safe_print(f"[AUTO] Next cycle in {interval // 60}:{interval % 60:02d}...")
+        safe_print(f"{YELLOW}[AUTO]{RESET} {DIM}Next cycle in {interval // 60}:{interval % 60:02d}...{RESET}")
         _sleep_interruptible(interval)
 
 
@@ -77,7 +128,6 @@ def _run_auto_cycle(personality: dict):
         "It's fine to just browse and vote if nothing catches your eye."
     )
 
-    # Include recent chat context so the auto loop knows about user instructions
     with chat_lock:
         context_msgs = list(chat_messages[-6:])
 
@@ -92,7 +142,7 @@ def _run_auto_cycle(personality: dict):
     )
 
     if response:
-        safe_print(f"[AUTO] {response}")
+        safe_print(f"{YELLOW}[AUTO]{RESET} {response}")
 
 
 # -- Personality update --------------------------------------------------------
@@ -130,7 +180,7 @@ def update_personality(personality: dict, user_message: str, agent_response: str
                 if key in personality and value:
                     personality[key] = value
             save_personality(personality)
-            safe_print("  [personality updated]")
+            safe_print(f"  {MAGENTA}[personality updated]{RESET}")
     except (json.JSONDecodeError, ValueError):
         pass
 
@@ -140,24 +190,24 @@ def update_personality(personality: dict, user_message: str, agent_response: str
 
 def main():
     if not settings.anthropic_api_key:
-        print("Error: ANTHROPIC_API_KEY not set. Copy .env.example to .env and fill it in.")
+        print(f"{RED}Error: ANTHROPIC_API_KEY not set. Copy .env.example to .env and fill it in.{RESET}")
         sys.exit(1)
     if not settings.bot_book_api_key:
-        print("Error: BOT_BOOK_API_KEY not set. Register a bot at your bot-book instance first.")
+        print(f"{RED}Error: BOT_BOOK_API_KEY not set. Register a bot at your bot-book instance first.{RESET}")
         sys.exit(1)
 
     personality = load_personality()
 
     name = personality.get("name", "Agent")
     print()
-    print("=" * 50)
-    print(f"  agent-book — {name}")
-    print("  Your AI agent for bot-book")
-    print(f"  Forum: {settings.bot_book_url}")
+    print(f"{CYAN}{BOLD}{'=' * 50}{RESET}")
+    print(f"{CYAN}{BOLD}  agent-book{RESET} {DIM}— {name}{RESET}")
+    print(f"  {DIM}Your AI agent for bot-book{RESET}")
+    print(f"  {DIM}Forum:{RESET} {BLUE}{settings.bot_book_url}{RESET}")
     print()
-    print("  Type messages to chat, or just let it run.")
-    print('  Commands: "stop" / "resume" / "quit"')
-    print("=" * 50)
+    print(f"  {DIM}Type messages to chat, or just let it run.{RESET}")
+    print(f"  {DIM}Commands:{RESET} {YELLOW}stop{RESET} {DIM}/{RESET} {GREEN}resume{RESET} {DIM}/{RESET} {RED}quit{RESET}")
+    print(f"{CYAN}{BOLD}{'=' * 50}{RESET}")
     print()
 
     # Start auto loop in background
@@ -166,11 +216,24 @@ def main():
 
     system = generate_system_prompt(personality)
 
+    # Multi-line input: Enter submits, Shift+Enter / Alt+Enter adds newline
+    kb = KeyBindings()
+
+    @kb.add("escape", "enter")  # Alt+Enter
+    def _(event):
+        event.current_buffer.insert_text("\n")
+
+    @kb.add("s-enter")  # Shift+Enter (terminal support varies)
+    def _(event):
+        event.current_buffer.insert_text("\n")
+
+    session = PromptSession(key_bindings=kb, multiline=False)
+
     while running.is_set():
         try:
-            user_input = input("You: ").strip()
+            user_input = session.prompt(HTML("<ansigreen><b>You: </b></ansigreen>")).strip()
         except (EOFError, KeyboardInterrupt):
-            safe_print("\nShutting down...")
+            safe_print(f"\n{DIM}Shutting down...{RESET}")
             running.clear()
             break
 
@@ -179,16 +242,16 @@ def main():
 
         lower = user_input.lower()
         if lower in ("quit", "exit", "q"):
-            safe_print("Shutting down...")
+            safe_print(f"{DIM}Shutting down...{RESET}")
             running.clear()
             break
         elif lower in ("stop", "stop posting", "pause"):
             auto_paused.set()
-            safe_print("Agent: Got it, I'll stop the auto cycle. Type 'resume' to restart.")
+            safe_print(f"{CYAN}Agent:{RESET} Got it, I'll stop the auto cycle. Type {GREEN}'resume'{RESET} to restart.")
             continue
         elif lower == "resume":
             auto_paused.clear()
-            safe_print("Agent: Resumed! I'll start posting again next cycle.")
+            safe_print(f"{CYAN}Agent:{RESET} Resumed! I'll start posting again next cycle.")
             continue
 
         # Chat with the agent (with tools available)
@@ -198,15 +261,17 @@ def main():
 
         system = generate_system_prompt(personality)
 
+        spinner.start()
         response, stats = run_agent_loop(
             messages=messages,
             system=system,
             tools=TOOLS,
             execute_tool=execute_tool,
             label="CHAT",
+            on_first_output=spinner.stop,
         )
 
-        safe_print(f"Agent: {response}")
+        safe_print(f"{CYAN}Agent:{RESET} {response}")
 
         with chat_lock:
             chat_messages.append({"role": "assistant", "content": response})
@@ -219,7 +284,7 @@ def main():
         ).start()
 
     save_personality(personality)
-    safe_print("Personality saved. Goodbye!")
+    safe_print(f"{DIM}Personality saved. Goodbye!{RESET}")
 
 
 if __name__ == "__main__":
