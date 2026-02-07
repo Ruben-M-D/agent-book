@@ -6,17 +6,23 @@ import sys
 import threading
 import time
 
-from prompt_toolkit import PromptSession
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit import Application
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.styles import Style
+from prompt_toolkit.widgets import TextArea
 
 from config import settings
 from llm import run_agent_loop, simple_completion
 from personality import generate_system_prompt, load_personality, save_personality
 from tools import TOOLS, execute_tool
 
-# -- ANSI colors --------------------------------------------------------------
+# -- ANSI colors (used in output strings) -------------------------------------
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -33,8 +39,7 @@ RED = "\033[31m"
 auto_paused = threading.Event()
 running = threading.Event()
 running.set()
-
-print_lock = threading.Lock()
+thinking = threading.Event()
 
 chat_messages: list[dict] = []
 chat_lock = threading.Lock()
@@ -42,7 +47,37 @@ chat_lock = threading.Lock()
 cycle_count = 0
 
 HISTORY_PATH = os.path.join(os.path.dirname(__file__), "chat_history.json")
-MAX_HISTORY = 20  # keep last N messages across restarts
+MAX_HISTORY = 20
+
+# -- App globals (set in main) ------------------------------------------------
+
+app: Application | None = None
+output_window: Window | None = None
+output_lines: list[str] = []
+output_lock = threading.Lock()
+
+
+def append_output(text: str):
+    """Thread-safe append to the output area."""
+    with output_lock:
+        output_lines.append(text)
+    if output_window:
+        output_window.vertical_scroll = 999999
+    if app and app.is_running:
+        app.invalidate()
+
+
+def get_output_text():
+    with output_lock:
+        return ANSI("\n".join(output_lines))
+
+
+def invalidate():
+    if app and app.is_running:
+        app.invalidate()
+
+
+# -- History ------------------------------------------------------------------
 
 
 def load_history() -> list[dict]:
@@ -56,54 +91,12 @@ def load_history() -> list[dict]:
 
 
 def save_history(messages: list[dict]):
-    # Only save simple text messages (not tool-use blocks)
     saveable = []
     for msg in messages[-MAX_HISTORY:]:
         if isinstance(msg.get("content"), str):
             saveable.append(msg)
     with open(HISTORY_PATH, "w") as f:
         json.dump(saveable, f)
-
-
-def safe_print(*args, **kwargs):
-    with print_lock:
-        print(*args, **kwargs, flush=True)
-
-
-class Spinner:
-    """Animated thinking indicator that runs in a background thread."""
-
-    FRAMES = [
-        f"   {DIM}thinking.{RESET}",
-        f"   {DIM}thinking..{RESET}",
-        f"   {DIM}thinking...{RESET}",
-    ]
-
-    def __init__(self):
-        self._stop = threading.Event()
-        self._thread = None
-
-    def start(self):
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._spin, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        if self._thread:
-            self._thread.join()
-        print(f"\r{' ' * 20}\r", end="", flush=True)
-
-    def _spin(self):
-        i = 0
-        while not self._stop.is_set():
-            frame = self.FRAMES[i % len(self.FRAMES)]
-            print(f"\r{frame}", end="", flush=True)
-            i += 1
-            self._stop.wait(0.5)
-
-
-spinner = Spinner()
 
 
 # -- Auto loop ----------------------------------------------------------------
@@ -118,21 +111,20 @@ def auto_loop(personality: dict):
         cycle_count += 1
 
         if auto_paused.is_set():
-            safe_print(f"\n{YELLOW}[AUTO]{RESET} {DIM}Cycle {cycle_count} — paused. Type 'resume' to restart.{RESET}")
+            append_output(f"{YELLOW}[AUTO]{RESET} {DIM}Cycle {cycle_count} — paused. Type 'resume' to restart.{RESET}")
         else:
-            safe_print(f"\n{YELLOW}[AUTO]{RESET} Cycle {cycle_count} starting...")
+            append_output(f"{YELLOW}[AUTO]{RESET} Cycle {cycle_count} starting...")
             try:
                 _run_auto_cycle(personality)
             except Exception as e:
-                safe_print(f"{RED}[AUTO] Error: {e}{RESET}")
+                append_output(f"{RED}[AUTO] Error: {e}{RESET}")
 
         interval = settings.auto_interval
-        safe_print(f"{YELLOW}[AUTO]{RESET} {DIM}Next cycle in {interval // 60}:{interval % 60:02d}...{RESET}")
+        append_output(f"{YELLOW}[AUTO]{RESET} {DIM}Next cycle in {interval // 60}:{interval % 60:02d}...{RESET}")
         _sleep_interruptible(interval)
 
 
 def _sleep_interruptible(seconds: int):
-    """Sleep in 1-second increments so we can exit quickly."""
     for _ in range(seconds):
         if not running.is_set():
             return
@@ -164,17 +156,17 @@ def _run_auto_cycle(personality: dict):
         tools=TOOLS,
         execute_tool=execute_tool,
         label="AUTO",
+        output_fn=append_output,
     )
 
     if response:
-        safe_print(f"{YELLOW}[AUTO]{RESET} {response}")
+        append_output(f"{YELLOW}[AUTO]{RESET} {response}")
 
 
 # -- Personality update --------------------------------------------------------
 
 
 def update_personality(personality: dict, user_message: str, agent_response: str):
-    """Use Claude to analyze the conversation and update personality if needed."""
     prompt = (
         f"Current personality:\n{json.dumps(personality, indent=2)}\n\n"
         f"User said: {user_message}\n"
@@ -205,116 +197,196 @@ def update_personality(personality: dict, user_message: str, agent_response: str
                 if key in personality and value:
                     personality[key] = value
             save_personality(personality)
-            safe_print(f"  {MAGENTA}[personality updated]{RESET}")
+            append_output(f"  {MAGENTA}[personality updated]{RESET}")
     except (json.JSONDecodeError, ValueError):
         pass
 
 
-# -- Main ----------------------------------------------------------------------
+# -- Input processing (runs in background thread) -----------------------------
+
+personality = None
+input_area = None
+
+
+def process_input(text: str):
+    global personality
+
+    lower = text.lower()
+    if lower in ("quit", "exit", "q"):
+        _shutdown()
+        return
+    elif lower in ("stop", "stop posting", "pause"):
+        auto_paused.set()
+        append_output(f"{CYAN}Agent:{RESET} Got it, I'll stop the auto cycle. Type {GREEN}'resume'{RESET} to restart.")
+        invalidate()
+        return
+    elif lower == "resume":
+        auto_paused.clear()
+        append_output(f"{CYAN}Agent:{RESET} Resumed! I'll start posting again next cycle.")
+        invalidate()
+        return
+
+    append_output(f"{GREEN}You:{RESET} {text}")
+
+    with chat_lock:
+        chat_messages.append({"role": "user", "content": text})
+        messages = list(chat_messages)
+
+    system = generate_system_prompt(personality)
+
+    thinking.set()
+    invalidate()
+
+    response, stats = run_agent_loop(
+        messages=messages,
+        system=system,
+        tools=TOOLS,
+        execute_tool=execute_tool,
+        label="CHAT",
+        output_fn=append_output,
+        on_first_output=lambda: (thinking.clear(), invalidate()),
+    )
+
+    thinking.clear()
+    append_output(f"{CYAN}Agent:{RESET} {response}")
+
+    with chat_lock:
+        chat_messages.append({"role": "assistant", "content": response})
+
+    threading.Thread(
+        target=update_personality,
+        args=(personality, text, response),
+        daemon=True,
+    ).start()
+
+
+def _shutdown():
+    running.clear()
+    with chat_lock:
+        save_history(chat_messages)
+    save_personality(personality)
+    if app and app.is_running:
+        app.exit()
+
+
+# -- UI -----------------------------------------------------------------------
+
+
+def build_status_bar():
+    if thinking.is_set():
+        return [("class:status-thinking", "  thinking... ")]
+    if auto_paused.is_set():
+        return [("class:status-paused", "  paused "), ("class:status", " type 'resume' to restart")]
+    return [("class:status", f"  agent-book | auto cycle every {settings.auto_interval}s ")]
+
+
+ui_style = Style.from_dict({
+    "separator": "#444444",
+    "prompt": "ansigreen bold",
+    "status": "#666666",
+    "status-thinking": "ansiyellow",
+    "status-paused": "ansired",
+})
 
 
 def main():
+    global app, output_window, personality, input_area
+
     if not settings.anthropic_api_key:
-        print(f"{RED}Error: ANTHROPIC_API_KEY not set. Copy .env.example to .env and fill it in.{RESET}")
+        print(f"Error: ANTHROPIC_API_KEY not set. Copy .env.example to .env and fill it in.")
         sys.exit(1)
     if not settings.bot_book_api_key:
-        print(f"{RED}Error: BOT_BOOK_API_KEY not set. Register a bot at your bot-book instance first.{RESET}")
+        print(f"Error: BOT_BOOK_API_KEY not set. Register a bot at your bot-book instance first.")
         sys.exit(1)
 
     personality = load_personality()
 
-    # Restore chat history from last session
     with chat_lock:
         chat_messages.extend(load_history())
-    if chat_messages:
-        print(f"{DIM}  Restored {len(chat_messages)} messages from last session{RESET}")
 
     name = personality.get("name", "Agent")
-    print()
-    print(f"{CYAN}{BOLD}{'=' * 50}{RESET}")
-    print(f"{CYAN}{BOLD}  agent-book{RESET} {DIM}— {name}{RESET}")
-    print(f"  {DIM}Your AI agent for bot-book{RESET}")
-    print(f"  {DIM}Forum:{RESET} {BLUE}{settings.bot_book_url}{RESET}")
-    print()
-    print(f"  {DIM}Type messages to chat, or just let it run.{RESET}")
-    print(f"  {DIM}Commands:{RESET} {YELLOW}stop{RESET} {DIM}/{RESET} {GREEN}resume{RESET} {DIM}/{RESET} {RED}quit{RESET}")
-    print(f"{CYAN}{BOLD}{'=' * 50}{RESET}")
-    print()
 
-    # Start auto loop in background
+    # Seed the output area with the banner
+    banner_lines = [
+        f"{CYAN}{BOLD}{'═' * 50}{RESET}",
+        f"{CYAN}{BOLD}  agent-book{RESET} {DIM}— {name}{RESET}",
+        f"  {DIM}Your AI agent for bot-book{RESET}",
+        f"  {DIM}Forum:{RESET} {BLUE}{settings.bot_book_url}{RESET}",
+        "",
+        f"  {DIM}Type messages below. Alt+Enter for newline.{RESET}",
+        f"  {DIM}Commands:{RESET} {YELLOW}stop{RESET} {DIM}/{RESET} {GREEN}resume{RESET} {DIM}/{RESET} {RED}quit{RESET}",
+        f"{CYAN}{BOLD}{'═' * 50}{RESET}",
+    ]
+    if chat_messages:
+        banner_lines.append(f"  {DIM}Restored {len(chat_messages)} messages from last session{RESET}")
+    banner_lines.append("")
+
+    with output_lock:
+        output_lines.extend(banner_lines)
+
+    # Output area
+    output_control = FormattedTextControl(get_output_text, focusable=False, show_cursor=False)
+    output_window = Window(content=output_control, wrap_lines=True)
+
+    # Input area
+    input_area = TextArea(
+        height=Dimension(min=1, max=5),
+        prompt=[("class:prompt", "You: ")],
+        multiline=True,
+        focus_on_click=True,
+        dont_extend_height=True,
+    )
+
+    separator = Window(height=1, char="─", style="class:separator")
+    status_bar = Window(
+        height=1,
+        content=FormattedTextControl(build_status_bar),
+    )
+
+    root = HSplit([
+        output_window,
+        separator,
+        input_area,
+        status_bar,
+    ])
+
+    # Key bindings
+    kb = KeyBindings()
+
+    @kb.add("enter")
+    def handle_enter(event):
+        text = input_area.text.strip()
+        if text:
+            input_area.text = ""
+            threading.Thread(target=process_input, args=(text,), daemon=True).start()
+
+    @kb.add("escape", "enter")
+    def handle_alt_enter(event):
+        event.current_buffer.insert_text("\n")
+
+    @kb.add("c-c")
+    @kb.add("c-d")
+    def handle_quit(event):
+        _shutdown()
+
+    app = Application(
+        layout=Layout(root, focused_element=input_area),
+        key_bindings=kb,
+        style=ui_style,
+        full_screen=True,
+        mouse_support=True,
+    )
+
+    # Start auto loop
     auto_thread = threading.Thread(target=auto_loop, args=(personality,), daemon=True)
     auto_thread.start()
 
-    system = generate_system_prompt(personality)
+    app.run()
 
-    # Multi-line input: Enter submits, Shift+Enter / Alt+Enter adds newline
-    kb = KeyBindings()
-
-    @kb.add("escape", "enter")  # Alt+Enter
-    def _(event):
-        event.current_buffer.insert_text("\n")
-
-    session = PromptSession(key_bindings=kb, multiline=False)
-
-    with patch_stdout():
-        while running.is_set():
-            try:
-                user_input = session.prompt(HTML("<ansigreen><b>You: </b></ansigreen>")).strip()
-            except (EOFError, KeyboardInterrupt):
-                safe_print(f"\n{DIM}Shutting down...{RESET}")
-                running.clear()
-                break
-
-            if not user_input:
-                continue
-
-            lower = user_input.lower()
-            if lower in ("quit", "exit", "q"):
-                safe_print(f"{DIM}Shutting down...{RESET}")
-                running.clear()
-                break
-            elif lower in ("stop", "stop posting", "pause"):
-                auto_paused.set()
-                safe_print(f"{CYAN}Agent:{RESET} Got it, I'll stop the auto cycle. Type {GREEN}'resume'{RESET} to restart.")
-                continue
-            elif lower == "resume":
-                auto_paused.clear()
-                safe_print(f"{CYAN}Agent:{RESET} Resumed! I'll start posting again next cycle.")
-                continue
-
-            # Chat with the agent (with tools available)
-            with chat_lock:
-                chat_messages.append({"role": "user", "content": user_input})
-                messages = list(chat_messages)
-
-            system = generate_system_prompt(personality)
-
-            spinner.start()
-            response, stats = run_agent_loop(
-                messages=messages,
-                system=system,
-                tools=TOOLS,
-                execute_tool=execute_tool,
-                label="CHAT",
-                on_first_output=spinner.stop,
-            )
-
-            safe_print(f"{CYAN}Agent:{RESET} {response}")
-
-            with chat_lock:
-                chat_messages.append({"role": "assistant", "content": response})
-
-            # Background personality update
-            threading.Thread(
-                target=update_personality,
-                args=(personality, user_input, response),
-                daemon=True,
-            ).start()
-
+    # Final save (in case _shutdown wasn't called)
     with chat_lock:
         save_history(chat_messages)
     save_personality(personality)
-    safe_print(f"{DIM}Personality saved. Goodbye!{RESET}")
 
 
 if __name__ == "__main__":

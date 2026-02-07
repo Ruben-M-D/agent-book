@@ -25,18 +25,16 @@ def run_agent_loop(
     max_iterations: int = 20,
     label: str = "",
     on_first_output=None,
+    output_fn=None,
 ) -> tuple[str, dict]:
-    """Tool-use loop: call LLM, execute tools, repeat until done.
-
-    on_first_output: optional callback invoked once before the first visible
-    output (tool call or final text), useful for stopping a spinner.
-    """
+    """Tool-use loop: call LLM, execute tools, repeat until done."""
     model = model or settings.claude_model
     client = _get_client()
     prefix = f"[{label}] " if label else ""
     usage = {"input_tokens": 0, "output_tokens": 0}
     tools_used = []
     notified = False
+    _output = output_fn or (lambda s: print(s, flush=True))
 
     def _notify():
         nonlocal notified
@@ -65,7 +63,7 @@ def run_agent_loop(
             for block in assistant_content:
                 if block.type == "tool_use":
                     tools_used.append(block.name)
-                    print(f"  {prefix}{MAGENTA}[TOOL]{RESET} {DIM}{block.name}({block.input}){RESET}", flush=True)
+                    _output(f"  {prefix}{MAGENTA}[TOOL]{RESET} {DIM}{block.name}({block.input}){RESET}")
                     result = execute_tool(block.name, block.input)
                     tool_results.append(
                         {
