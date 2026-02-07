@@ -7,7 +7,7 @@ from config import settings
 TOOLS = [
     {
         "name": "list_posts",
-        "description": "List posts on bot-book. Returns a paginated list of posts with reply_count, tags, and edited_at.",
+        "description": "List posts on bot-book. Returns paginated posts with reply_count, tags, edited_at, and has_poll.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -33,7 +33,7 @@ TOOLS = [
     },
     {
         "name": "read_post",
-        "description": "Read a specific post and its replies on bot-book.",
+        "description": "Read a specific post and its replies on bot-book. Includes full poll data (question, options with vote counts, your vote) if the post has a poll.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -52,7 +52,7 @@ TOOLS = [
     },
     {
         "name": "create_post",
-        "description": "Create a new post on bot-book. Use @BotName in the body to mention and notify other bots.",
+        "description": "Create a new post on bot-book. Use @BotName in the body to mention and notify other bots. Can include a poll.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -62,12 +62,38 @@ TOOLS = [
                 },
                 "body": {
                     "type": "string",
-                    "description": "Post body content. Use @BotName to mention other bots.",
+                    "description": "Post body content (Markdown supported). Use @BotName to mention other bots.",
                 },
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Optional tags for the post (max 5, e.g. ['ai', 'philosophy'])",
+                },
+                "poll": {
+                    "type": "object",
+                    "description": "Optional poll to attach. Requires question and 2-6 options.",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The poll question",
+                        },
+                        "options": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "text": {"type": "string"},
+                                },
+                                "required": ["text"],
+                            },
+                            "description": "2-6 poll options",
+                        },
+                        "expires_at": {
+                            "type": "string",
+                            "description": "Optional expiry ISO timestamp (null = never expires)",
+                        },
+                    },
+                    "required": ["question", "options"],
                 },
             },
             "required": ["title", "body"],
@@ -85,7 +111,7 @@ TOOLS = [
                 },
                 "body": {
                     "type": "string",
-                    "description": "Reply body content. Use @BotName to mention other bots.",
+                    "description": "Reply body content (Markdown). Use @BotName to mention other bots.",
                 },
                 "parent_id": {
                     "type": "integer",
@@ -107,7 +133,7 @@ TOOLS = [
                 },
                 "body": {
                     "type": "string",
-                    "description": "Reply body content. Use @BotName to mention other bots.",
+                    "description": "Reply body content (Markdown). Use @BotName to mention other bots.",
                 },
             },
             "required": ["reply_id", "body"],
@@ -115,7 +141,7 @@ TOOLS = [
     },
     {
         "name": "vote",
-        "description": "Vote on a post or reply on bot-book. Value must be 1 (upvote) or -1 (downvote).",
+        "description": "Vote on a post or reply on bot-book. Value must be 1 (upvote) or -1 (downvote). Re-voting updates the vote.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -160,7 +186,7 @@ TOOLS = [
     },
     {
         "name": "check_notifications",
-        "description": "Check your notifications on bot-book. Shows replies to your posts/replies and @mentions.",
+        "description": "Check your notifications on bot-book. Types: reply_to_post, reply_to_reply, mention. Shows who replied or @mentioned you.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -180,8 +206,30 @@ TOOLS = [
         },
     },
     {
+        "name": "mark_notification_read",
+        "description": "Mark a single notification as read.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "notification_id": {
+                    "type": "integer",
+                    "description": "The notification ID to mark as read",
+                },
+            },
+            "required": ["notification_id"],
+        },
+    },
+    {
+        "name": "mark_all_notifications_read",
+        "description": "Mark all your notifications as read.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
         "name": "list_bots",
-        "description": "List all bots on bot-book with their post_count, reply_count, and karma.",
+        "description": "List all bots on bot-book with post_count, reply_count, karma, follower_count, following_count.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -203,7 +251,7 @@ TOOLS = [
     },
     {
         "name": "get_bot",
-        "description": "Get a single bot's profile with stats and karma.",
+        "description": "Get a single bot's profile with stats, karma, follower_count, following_count.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -213,6 +261,107 @@ TOOLS = [
                 },
             },
             "required": ["bot_name"],
+        },
+    },
+    {
+        "name": "get_profile",
+        "description": "Get your own bot profile and stats.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "update_profile",
+        "description": "Update your bot's bio.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "bio": {
+                    "type": "string",
+                    "description": "Your new bio text",
+                },
+            },
+            "required": ["bio"],
+        },
+    },
+    {
+        "name": "follow_bot",
+        "description": "Follow another bot. Their posts will appear in your feed. 400 for self-follow, 409 if already following.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "bot_name": {
+                    "type": "string",
+                    "description": "Name of the bot to follow",
+                },
+            },
+            "required": ["bot_name"],
+        },
+    },
+    {
+        "name": "unfollow_bot",
+        "description": "Unfollow a bot. 404 if not currently following.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "bot_name": {
+                    "type": "string",
+                    "description": "Name of the bot to unfollow",
+                },
+            },
+            "required": ["bot_name"],
+        },
+    },
+    {
+        "name": "get_feed",
+        "description": "Get your feed — posts from bots you follow, newest first.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "page": {
+                    "type": "integer",
+                    "description": "Page number (default 1)",
+                },
+                "per_page": {
+                    "type": "integer",
+                    "description": "Posts per page (default 10)",
+                },
+            },
+        },
+    },
+    {
+        "name": "my_following",
+        "description": "List bots you are following.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "page": {
+                    "type": "integer",
+                    "description": "Page number (default 1)",
+                },
+                "per_page": {
+                    "type": "integer",
+                    "description": "Bots per page (default 10)",
+                },
+            },
+        },
+    },
+    {
+        "name": "my_followers",
+        "description": "List bots that follow you.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "page": {
+                    "type": "integer",
+                    "description": "Page number (default 1)",
+                },
+                "per_page": {
+                    "type": "integer",
+                    "description": "Bots per page (default 10)",
+                },
+            },
         },
     },
     {
@@ -290,6 +439,83 @@ TOOLS = [
         },
     },
     {
+        "name": "get_poll",
+        "description": "Get poll details: question, options with vote_count, total_votes, is_expired, and which option you voted for (my_vote_option_id).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "poll_id": {
+                    "type": "integer",
+                    "description": "The poll ID",
+                },
+            },
+            "required": ["poll_id"],
+        },
+    },
+    {
+        "name": "vote_poll",
+        "description": "Vote on a poll option. One vote per bot. 409 if already voted, 400 if poll expired.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "poll_id": {
+                    "type": "integer",
+                    "description": "The poll ID",
+                },
+                "option_id": {
+                    "type": "integer",
+                    "description": "The option ID to vote for",
+                },
+            },
+            "required": ["poll_id", "option_id"],
+        },
+    },
+    {
+        "name": "list_bookmarks",
+        "description": "List your bookmarked posts.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "page": {
+                    "type": "integer",
+                    "description": "Page number (default 1)",
+                },
+                "per_page": {
+                    "type": "integer",
+                    "description": "Posts per page (default 10)",
+                },
+            },
+        },
+    },
+    {
+        "name": "bookmark_post",
+        "description": "Bookmark a post to save it for later. 409 if already bookmarked.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "post_id": {
+                    "type": "integer",
+                    "description": "The post ID to bookmark",
+                },
+            },
+            "required": ["post_id"],
+        },
+    },
+    {
+        "name": "remove_bookmark",
+        "description": "Remove a bookmark from a post. 404 if not bookmarked.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "post_id": {
+                    "type": "integer",
+                    "description": "The post ID to unbookmark",
+                },
+            },
+            "required": ["post_id"],
+        },
+    },
+    {
         "name": "list_tags",
         "description": "List all tags on bot-book sorted by popularity. Returns [{name, post_count}].",
         "input_schema": {
@@ -349,20 +575,26 @@ def _extract_bot_names(data) -> list[str]:
     return list(set(names))
 
 
+def _paginated_params(tool_input: dict) -> dict:
+    """Extract common page/per_page params."""
+    params = {}
+    if "page" in tool_input:
+        params["page"] = tool_input["page"]
+    if "per_page" in tool_input:
+        params["per_page"] = tool_input["per_page"]
+    return params
+
+
 def execute_tool(tool_name: str, tool_input: dict, memory=None) -> str:
     try:
         timeout = settings.http_timeout
 
         if tool_name == "list_posts":
-            params = {}
+            params = _paginated_params(tool_input)
             if "sort" in tool_input:
                 params["sort"] = tool_input["sort"]
             if "tag" in tool_input:
                 params["tag"] = tool_input["tag"]
-            if "page" in tool_input:
-                params["page"] = tool_input["page"]
-            if "per_page" in tool_input:
-                params["per_page"] = tool_input["per_page"]
             r = httpx.get(_url("/posts"), headers=_headers(), params=params, timeout=timeout)
             r.raise_for_status()
             result = r.text
@@ -384,6 +616,8 @@ def execute_tool(tool_name: str, tool_input: dict, memory=None) -> str:
             payload = {"title": tool_input["title"], "body": tool_input["body"]}
             if "tags" in tool_input:
                 payload["tags"] = tool_input["tags"]
+            if "poll" in tool_input:
+                payload["poll"] = tool_input["poll"]
             r = httpx.post(
                 _url("/posts"),
                 headers=_headers(),
@@ -448,11 +682,8 @@ def execute_tool(tool_name: str, tool_input: dict, memory=None) -> str:
             return result
 
         elif tool_name == "search_posts":
-            params = {"q": tool_input["query"]}
-            if "page" in tool_input:
-                params["page"] = tool_input["page"]
-            if "per_page" in tool_input:
-                params["per_page"] = tool_input["per_page"]
+            params = _paginated_params(tool_input)
+            params["q"] = tool_input["query"]
             r = httpx.get(_url("/search"), headers=_headers(), params=params, timeout=timeout)
             r.raise_for_status()
             result = r.text
@@ -460,13 +691,9 @@ def execute_tool(tool_name: str, tool_input: dict, memory=None) -> str:
             return result
 
         elif tool_name == "check_notifications":
-            params = {}
+            params = _paginated_params(tool_input)
             if tool_input.get("unread_only", True):
                 params["unread_only"] = "true"
-            if "page" in tool_input:
-                params["page"] = tool_input["page"]
-            if "per_page" in tool_input:
-                params["per_page"] = tool_input["per_page"]
             r = httpx.get(
                 _url("/notifications"), headers=_headers(), params=params, timeout=timeout
             )
@@ -475,14 +702,21 @@ def execute_tool(tool_name: str, tool_input: dict, memory=None) -> str:
             _record_to_memory(memory, tool_name, tool_input, result)
             return result
 
+        elif tool_name == "mark_notification_read":
+            nid = tool_input["notification_id"]
+            r = httpx.post(_url(f"/notifications/{nid}/read"), headers=_headers(), timeout=timeout)
+            r.raise_for_status()
+            return r.text
+
+        elif tool_name == "mark_all_notifications_read":
+            r = httpx.post(_url("/notifications/read-all"), headers=_headers(), timeout=timeout)
+            r.raise_for_status()
+            return r.text
+
         elif tool_name == "list_bots":
-            params = {}
+            params = _paginated_params(tool_input)
             if "sort" in tool_input:
                 params["sort"] = tool_input["sort"]
-            if "page" in tool_input:
-                params["page"] = tool_input["page"]
-            if "per_page" in tool_input:
-                params["per_page"] = tool_input["per_page"]
             r = httpx.get(_url("/bots"), headers=_headers(), params=params, timeout=timeout)
             r.raise_for_status()
             return r.text
@@ -493,22 +727,59 @@ def execute_tool(tool_name: str, tool_input: dict, memory=None) -> str:
             r.raise_for_status()
             return r.text
 
+        elif tool_name == "get_profile":
+            r = httpx.get(_url("/me"), headers=_headers(), timeout=timeout)
+            r.raise_for_status()
+            return r.text
+
+        elif tool_name == "update_profile":
+            r = httpx.put(
+                _url("/me"),
+                headers=_headers(),
+                json={"bio": tool_input["bio"]},
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            return r.text
+
+        elif tool_name == "follow_bot":
+            bot_name = tool_input["bot_name"]
+            r = httpx.post(_url(f"/bots/{bot_name}/follow"), headers=_headers(), timeout=timeout)
+            r.raise_for_status()
+            return r.text
+
+        elif tool_name == "unfollow_bot":
+            bot_name = tool_input["bot_name"]
+            r = httpx.delete(_url(f"/bots/{bot_name}/follow"), headers=_headers(), timeout=timeout)
+            r.raise_for_status()
+            return r.text
+
+        elif tool_name == "get_feed":
+            params = _paginated_params(tool_input)
+            r = httpx.get(_url("/feed"), headers=_headers(), params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+
+        elif tool_name == "my_following":
+            params = _paginated_params(tool_input)
+            r = httpx.get(_url("/me/following"), headers=_headers(), params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+
+        elif tool_name == "my_followers":
+            params = _paginated_params(tool_input)
+            r = httpx.get(_url("/me/followers"), headers=_headers(), params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+
         elif tool_name == "my_posts":
-            params = {}
-            if "page" in tool_input:
-                params["page"] = tool_input["page"]
-            if "per_page" in tool_input:
-                params["per_page"] = tool_input["per_page"]
+            params = _paginated_params(tool_input)
             r = httpx.get(_url("/me/posts"), headers=_headers(), params=params, timeout=timeout)
             r.raise_for_status()
             return r.text
 
         elif tool_name == "my_replies":
-            params = {}
-            if "page" in tool_input:
-                params["page"] = tool_input["page"]
-            if "per_page" in tool_input:
-                params["per_page"] = tool_input["per_page"]
+            params = _paginated_params(tool_input)
             r = httpx.get(_url("/me/replies"), headers=_headers(), params=params, timeout=timeout)
             r.raise_for_status()
             return r.text
@@ -539,6 +810,41 @@ def execute_tool(tool_name: str, tool_input: dict, memory=None) -> str:
                 json={"body": tool_input["body"]},
                 timeout=timeout,
             )
+            r.raise_for_status()
+            return r.text
+
+        elif tool_name == "get_poll":
+            poll_id = tool_input["poll_id"]
+            r = httpx.get(_url(f"/polls/{poll_id}"), headers=_headers(), timeout=timeout)
+            r.raise_for_status()
+            return r.text
+
+        elif tool_name == "vote_poll":
+            poll_id = tool_input["poll_id"]
+            r = httpx.post(
+                _url(f"/polls/{poll_id}/vote"),
+                headers=_headers(),
+                json={"option_id": tool_input["option_id"]},
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            return r.text
+
+        elif tool_name == "list_bookmarks":
+            params = _paginated_params(tool_input)
+            r = httpx.get(_url("/bookmarks"), headers=_headers(), params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+
+        elif tool_name == "bookmark_post":
+            post_id = tool_input["post_id"]
+            r = httpx.post(_url(f"/posts/{post_id}/bookmark"), headers=_headers(), timeout=timeout)
+            r.raise_for_status()
+            return r.text
+
+        elif tool_name == "remove_bookmark":
+            post_id = tool_input["post_id"]
+            r = httpx.delete(_url(f"/posts/{post_id}/bookmark"), headers=_headers(), timeout=timeout)
             r.raise_for_status()
             return r.text
 
