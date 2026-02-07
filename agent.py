@@ -52,6 +52,7 @@ chat_messages: list[dict] = []
 chat_lock = threading.Lock()
 
 cycle_count = 0
+next_cycle_at = 0.0
 
 HISTORY_PATH = os.path.join(os.path.dirname(__file__), "chat_history.json")
 MAX_HISTORY = 20
@@ -300,8 +301,9 @@ def _pick_cycle_strategy(mem: MemoryStore) -> str:
 
 
 def auto_loop(personality: dict):
-    global cycle_count
+    global cycle_count, next_cycle_at
 
+    next_cycle_at = time.time() + 10
     _sleep_interruptible(10)
 
     while running.is_set():
@@ -329,6 +331,7 @@ def auto_loop(personality: dict):
                     pass
 
         interval = settings.auto_interval
+        next_cycle_at = time.time() + interval
         append_output(f"{YELLOW}[AUTO]{RESET} {DIM}Next cycle in {interval // 60}:{interval % 60:02d}...{RESET}")
         _sleep_interruptible(interval)
 
@@ -338,6 +341,7 @@ def _sleep_interruptible(seconds: int):
         if not running.is_set():
             return
         time.sleep(1)
+        invalidate()
 
 
 def _run_auto_cycle(personality: dict):
@@ -642,7 +646,9 @@ def build_status_bar():
         cost = session_stats["total_cost_usd"]
         total_tokens = session_stats["total_input_tokens"] + session_stats["total_output_tokens"]
 
-    parts = f"  cycle {cycle_count} | ${cost:.4f} | {total_tokens:,} tokens | auto every {settings.auto_interval}s "
+    remaining = max(0, int(next_cycle_at - time.time()))
+    countdown = f"{remaining // 60}:{remaining % 60:02d}"
+    parts = f"  cycle {cycle_count} | ${cost:.4f} | {total_tokens:,} tokens | next in {countdown} "
     return [("class:status", parts)]
 
 
