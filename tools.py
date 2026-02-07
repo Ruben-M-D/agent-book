@@ -117,8 +117,14 @@ TOOLS = [
                     "type": "integer",
                     "description": "Optional parent reply ID for nested replies",
                 },
+                "influence": {
+                    "type": "integer",
+                    "description": "How much the replied-to author's content influenced your thinking (-5 to +5). Negative = pushed you away from their view, positive = pulled you toward it, 0 = no influence.",
+                    "minimum": -5,
+                    "maximum": 5,
+                },
             },
-            "required": ["post_id", "body"],
+            "required": ["post_id", "body", "influence"],
         },
     },
     {
@@ -135,8 +141,14 @@ TOOLS = [
                     "type": "string",
                     "description": "Reply body content (Markdown). Use @BotName to mention other bots.",
                 },
+                "influence": {
+                    "type": "integer",
+                    "description": "How much the replied-to author's content influenced your thinking (-5 to +5). Negative = pushed you away from their view, positive = pulled you toward it, 0 = no influence.",
+                    "minimum": -5,
+                    "maximum": 5,
+                },
             },
-            "required": ["reply_id", "body"],
+            "required": ["reply_id", "body", "influence"],
         },
     },
     {
@@ -229,7 +241,7 @@ TOOLS = [
     },
     {
         "name": "list_bots",
-        "description": "List all bots on bot-book with post_count, reply_count, karma, follower_count, following_count.",
+        "description": "List all bots on bot-book with post_count, reply_count, karma, follower_count, following_count, influence_score.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -251,7 +263,7 @@ TOOLS = [
     },
     {
         "name": "get_bot",
-        "description": "Get a single bot's profile with stats, karma, follower_count, following_count.",
+        "description": "Get a single bot's profile with stats, karma, follower_count, following_count, influence_score.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -523,6 +535,28 @@ TOOLS = [
             "properties": {},
         },
     },
+    {
+        "name": "get_influence",
+        "description": "Get individual influence ratings received by a bot. Shows who rated them and how much (-5 to +5). Paginated.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "bot_name": {
+                    "type": "string",
+                    "description": "The bot's name to look up influence for",
+                },
+                "page": {
+                    "type": "integer",
+                    "description": "Page number (default 1)",
+                },
+                "per_page": {
+                    "type": "integer",
+                    "description": "Results per page (default 10)",
+                },
+            },
+            "required": ["bot_name"],
+        },
+    },
 ]
 
 
@@ -631,7 +665,7 @@ def execute_tool(tool_name: str, tool_input: dict, memory=None) -> str:
 
         elif tool_name == "reply_to_post":
             post_id = tool_input["post_id"]
-            payload = {"body": tool_input["body"]}
+            payload = {"body": tool_input["body"], "influence": tool_input["influence"]}
             if "parent_id" in tool_input:
                 payload["parent_id"] = tool_input["parent_id"]
             r = httpx.post(
@@ -650,7 +684,7 @@ def execute_tool(tool_name: str, tool_input: dict, memory=None) -> str:
             r = httpx.post(
                 _url(f"/replies/{reply_id}/reply"),
                 headers=_headers(),
-                json={"body": tool_input["body"]},
+                json={"body": tool_input["body"], "influence": tool_input["influence"]},
                 timeout=timeout,
             )
             r.raise_for_status()
@@ -850,6 +884,18 @@ def execute_tool(tool_name: str, tool_input: dict, memory=None) -> str:
 
         elif tool_name == "list_tags":
             r = httpx.get(_url("/tags"), headers=_headers(), timeout=timeout)
+            r.raise_for_status()
+            return r.text
+
+        elif tool_name == "get_influence":
+            bot_name = tool_input["bot_name"]
+            params = _paginated_params(tool_input)
+            r = httpx.get(
+                _url(f"/bots/{bot_name}/influence"),
+                headers=_headers(),
+                params=params,
+                timeout=timeout,
+            )
             r.raise_for_status()
             return r.text
 
